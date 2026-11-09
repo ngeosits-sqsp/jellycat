@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""
+Watch FareHarbor for Jellycat Diner (FAO Schwarz) availability on a target date.
+Alerts you (sound + optional phone push via ntfy.sh) and opens the booking page.
+Does NOT auto-book. You finish checkout yourself.
+
+pip install requests
+"""
+import time, random, webbrowser, sys
+import requests
+
+COMPANY   = "faoschwarz"
+ITEM_ID   = "592655"
+DATE      = "2026-12-06"
+INTERVAL  = 20          # seconds between checks (keep polite; don't go below ~10)
+NTFY_TOPIC = ""         # optional: pick a private topic name, then subscribe in the ntfy app
+
+BOOK_URL = (f"https://fareharbor.com/embeds/book/{COMPANY}/items/{ITEM_ID}/"
+            f"?full-items=yes&flow=1291189&date={DATE}")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": BOOK_URL,
+}
+
+# Embed-side endpoints (same ones the booking widget calls). Tried in order.
+ENDPOINTS = [
+    f"https://fareharbor.com/api/v1/companies/{COMPANY}/items/{ITEM_ID}/availabilities/date/{DATE}/",
+    f"https://fareharbor.com/api/v1/companies/{COMPANY}/items/{ITEM_ID}/calendar/{DATE[:4]}/{DATE[5:7]}/",
+]
+
+def alert(msg):
+    print(f"\n*** {msg} ***\n")
+    print("\a" * 3)
+    if NTFY_TOPIC:
+        try:
+            requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=msg.encode(),
+                          headers={"Title": "Jellycat Diner", "Click": BOOK_URL,
+                                   "Priority": "urgent"}, timeout=10)
+        except requests.RequestException:
+            pass
+    webbrowser.open(BOOK_URL)
+
+def check():
+    """Return list of open slots for DATE, or [] if none."""
+    for url in ENDPOINTS:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            print(f"  {r.status_code} from {url.split('/api/v1/')[-1]}")
+            continue
+        data = r.json()
+
+        # Per-date endpoint: {"availabilities": [...]}
+        if "availabilities" in data and "calendar" not in url:
+            return [a for a in data["availabilities"]
+                    if a.get("capacity", 0) > 0 or a.get("is_bookable_now")]
+
+        # Calendar endpoint: {"calendar": {"weeks": [{"days": [{"date":..., "availabilities":[...]}]}]}}
+        cal = data.get("calendar", data)
+        for week in cal.get("weeks", []):
+            for day in week.get("days", []):
+                if day.get("date") == DATE and day.get("availabilities"):
+                    return day["availabilities"]
+        return []
+    raise RuntimeError("No endpoint responded with 200; see fallback notes.")
+
+def main():
+    print(f"Watching {DATE} every ~{INTERVAL}s. Ctrl+C to stop.")
+    errors = 0
+    while True:
+        try:
+            slots = check()
+            errors = 0
+            ts = time.strftime("%H:%M:%S")
+            if slots:
+                times = ", ".join(str(s.get("start_at", "?"))[11:16] for s in slots)
+                alert(f"AVAILABLE on {DATE}: {times}")
+                break
+            print(f"[{ts}] nothing yet")
+        except Exception as e:
+            errors += 1
+            print(f"error: {e}")
+            if errors >= 5:
+                alert("Script failing repeatedly. Check the booking page manually!")
+                sys.exit(1)
+        time.sleep(INTERVAL + random.uniform(0, 5))
+
+if __name__ == "__main__":
+    main()
